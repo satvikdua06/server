@@ -25,7 +25,7 @@ app.use(express.json());
 // Store room state
 const rooms = new Map();
 
-// Helper function to get or create room
+// Helper: get or create room
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
@@ -33,151 +33,174 @@ function getRoom(roomId) {
       isPlaying: false,
       currentTime: 0,
       lastUpdate: Date.now(),
-      users: new Map() // Changed to Map to store user info
+      users: new Map(),
+      hostId: null
     });
   }
   return rooms.get(roomId);
 }
 
-// Helper function to get video title from YouTube URL
-function extractVideoTitle(url) {
-  const videoId = extractVideoId(url);
-  if (!videoId) return 'Unknown Video';
-  return `Video ${videoId.substring(0, 8)}...`; // Simplified title
-}
-
-function extractVideoId(url) {
-  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-  const match = url.match(regex);
-  return match ? match[1] : null;
-}
-
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
-  
-  // Join a room
+
+  // --- Join Room ---
   socket.on('join-room', (roomId, username) => {
     socket.join(roomId);
     socket.roomId = roomId;
     socket.username = username || `User${socket.id.substring(0, 4)}`;
-    
+
     const room = getRoom(roomId);
+
+    // If first user, make host
+    if (!room.hostId) {
+      room.hostId = socket.id;
+      console.log(`🎬 ${socket.username} is host of room ${roomId}`);
+    }
+
     room.users.set(socket.id, {
       id: socket.id,
       username: socket.username
     });
-    
+
     console.log(`${socket.username} joined room ${roomId}`);
-    
-    // Send current room state to new user
+
+    // Send current room state
     socket.emit('room-state', {
       currentVideo: room.currentVideo,
       isPlaying: room.isPlaying,
       currentTime: room.currentTime,
       lastUpdate: room.lastUpdate,
-      roomId: roomId
+      roomId: roomId,
+      hostId: room.hostId
     });
-    
-    // Notify others in room
+
+    // Notify others
     socket.to(roomId).emit('user-joined', socket.username);
-    
+
     // Send updated user list
     const userList = Array.from(room.users.values());
     io.to(roomId).emit('user-list', userList);
   });
-  
-  // Handle video changes
+
+  // --- Video change ---
   socket.on('video-change', (videoData) => {
     if (!socket.roomId) return;
-    
+
     const room = getRoom(socket.roomId);
     room.currentVideo = videoData;
     room.isPlaying = false;
     room.currentTime = 0;
     room.lastUpdate = Date.now();
-    
+
     console.log(`Video changed in room ${socket.roomId}:`, videoData.title);
-    
-    // Broadcast to all users in room including sender
+
     io.to(socket.roomId).emit('video-change', videoData);
   });
-  
-  // Handle play/pause
+
+  // --- Play / Pause ---
   socket.on('play-pause', (data) => {
     if (!socket.roomId) return;
-    
+
     const room = getRoom(socket.roomId);
     room.isPlaying = data.isPlaying;
     room.currentTime = data.currentTime || 0;
     room.lastUpdate = Date.now();
-    
-    console.log(`Play/pause in room ${socket.roomId}: ${data.isPlaying} at ${data.currentTime}`);
-    
-    // Broadcast to other users in room (not sender)
+
     socket.to(socket.roomId).emit('play-pause', data);
   });
-  
-  // Handle seeking
+
+  // --- Seek ---
   socket.on('seek', (data) => {
     if (!socket.roomId) return;
-    
+
     const room = getRoom(socket.roomId);
     room.currentTime = data.currentTime;
     room.isPlaying = data.isPlaying || false;
     room.lastUpdate = Date.now();
-    
-    console.log(`Seek in room ${socket.roomId} to: ${data.currentTime}`);
-    
-    // Broadcast to other users in room (not sender)
+
     socket.to(socket.roomId).emit('seek', data);
   });
-  
-  // Handle time sync requests
+
+  // --- Manual Sync Request ---
   socket.on('sync-request', () => {
     if (!socket.roomId) return;
-    
+
     const room = getRoom(socket.roomId);
     const timeSinceLastUpdate = (Date.now() - room.lastUpdate) / 1000;
-    const estimatedCurrentTime = room.currentTime + (room.isPlaying ? timeSinceLastUpdate : 0);
-    
+    const estimatedCurrentTime =
+      room.currentTime + (room.isPlaying ? timeSinceLastUpdate : 0);
+
     socket.emit('sync-response', {
       currentTime: Math.max(0, estimatedCurrentTime),
       isPlaying: room.isPlaying,
+      type: room.currentVideo?.type || "youtube",
       serverTime: Date.now()
     });
   });
-  
-  // Handle chat messages
+
+  // --- Heartbeat (Host only) ---
+  socket.on('heartbeat', (data) => {
+    if (!socket.roomId) return;
+    const room = getRoom(socket.roomId);
+
+    // Only host updates heartbeat
+    if (room.hostId !== socket.id) return;
+
+    room.isPlaying = data.isPlaying;
+    room.currentTime = data.currentTime || 0;
+    room.lastUpdate = Date.now();
+
+    // Send to all others
+    socket.to(socket.roomId).emit('heartbeat', data);
+
+    // console.log(`❤️ Heartbeat from host ${socket.username} in ${socket.roomId}`);
+  });
+
+  // --- Chat ---
   socket.on('chat-message', (message) => {
     if (!socket.roomId) return;
-    
+
     const chatData = {
       username: socket.username,
       message: message.trim(),
       timestamp: Date.now()
     };
-    
-    // Broadcast to all users in room including sender
+
     io.to(socket.roomId).emit('chat-message', chatData);
   });
-  
-  // Handle disconnect
+
+  // --- Disconnect ---
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
-    
+
     if (socket.roomId) {
       const room = getRoom(socket.roomId);
       room.users.delete(socket.id);
-      
-      // Notify others in room
+
+      // If host left, reassign to first user in room
+      if (room.hostId === socket.id) {
+        const nextHost = room.users.keys().next().value || null;
+        room.hostId = nextHost;
+        if (nextHost) {
+          const newHost = room.users.get(nextHost);
+          console.log(`👑 New host in room ${socket.roomId}: ${newHost.username}`);
+          io.to(socket.roomId).emit('room-state', {
+            ...room,
+            roomId: socket.roomId,
+            hostId: room.hostId
+          });
+        } else {
+          console.log(`Room ${socket.roomId} now has no host`);
+        }
+      }
+
       if (socket.username) {
         socket.to(socket.roomId).emit('user-left', socket.username);
       }
-      
-      // Send updated user list
+
       const userList = Array.from(room.users.values());
       socket.to(socket.roomId).emit('user-list', userList);
-      
+
       // Clean up empty rooms
       if (room.users.size === 0) {
         rooms.delete(socket.roomId);
@@ -187,18 +210,18 @@ io.on('connection', (socket) => {
   });
 });
 
-// Health check endpoint
+// Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'Sync Music Server is running!', 
+  res.json({
+    status: 'Sync Music Server is running!',
     rooms: rooms.size,
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     rooms: rooms.size,
     uptime: process.uptime()
   });
