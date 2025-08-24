@@ -9,14 +9,14 @@ const server = http.createServer(app);
 // Configure CORS for Socket.io
 const io = socketIo(server, {
   cors: {
-    origin: ["http://localhost:3000", "https://*.vercel.app"],
+    origin: ["http://localhost:3000", "https://*.vercel.app", "https://*.onrender.com"],
     methods: ["GET", "POST"],
     credentials: true
   }
 });
 
 app.use(cors({
-  origin: ["http://localhost:3000", "https://*.vercel.app"],
+  origin: ["http://localhost:3000", "https://*.vercel.app", "https://*.onrender.com"],
   credentials: true
 }));
 
@@ -205,7 +205,7 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🎵 Sync Music Server running on port ${PORT}`);
   console.log(`📡 Socket.IO ready for connections`);
 });
