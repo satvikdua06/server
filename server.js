@@ -33,6 +33,7 @@ function getRoom(roomId) {
       isPlaying: false,
       currentTime: 0,
       lastUpdate: Date.now(),
+      lastController: null, // Track who last controlled the video
       users: new Map(),
       hostId: null
     });
@@ -51,7 +52,7 @@ io.on('connection', (socket) => {
 
     const room = getRoom(roomId);
 
-    // If first user, make host
+    // If first user, make host (for room management purposes)
     if (!room.hostId) {
       room.hostId = socket.id;
       console.log(`🎬 ${socket.username} is host of room ${roomId}`);
@@ -71,18 +72,22 @@ io.on('connection', (socket) => {
       currentTime: room.currentTime,
       lastUpdate: room.lastUpdate,
       roomId: roomId,
-      hostId: room.hostId
+      hostId: room.hostId,
+      lastController: room.lastController
     });
 
     // Notify others
-    socket.to(roomId).emit('user-joined', socket.username);
+    socket.to(roomId).emit('user-joined', {
+      username: socket.username,
+      userId: socket.id
+    });
 
     // Send updated user list
     const userList = Array.from(room.users.values());
     io.to(roomId).emit('user-list', userList);
   });
 
-  // --- Video change ---
+  // --- Video change (anyone can change) ---
   socket.on('video-change', (videoData) => {
     if (!socket.roomId) return;
 
@@ -91,13 +96,19 @@ io.on('connection', (socket) => {
     room.isPlaying = false;
     room.currentTime = 0;
     room.lastUpdate = Date.now();
+    room.lastController = socket.id;
 
-    console.log(`Video changed in room ${socket.roomId}:`, videoData.title);
+    console.log(`Video changed in room ${socket.roomId} by ${socket.username}:`, videoData.title);
 
-    io.to(socket.roomId).emit('video-change', videoData);
+    // Broadcast to everyone including sender for consistency
+    io.to(socket.roomId).emit('video-change', {
+      ...videoData,
+      changedBy: socket.username,
+      changerId: socket.id
+    });
   });
 
-  // --- Play / Pause ---
+  // --- Play / Pause (anyone can control) ---
   socket.on('play-pause', (data) => {
     if (!socket.roomId) return;
 
@@ -105,11 +116,17 @@ io.on('connection', (socket) => {
     room.isPlaying = data.isPlaying;
     room.currentTime = data.currentTime || 0;
     room.lastUpdate = Date.now();
+    room.lastController = socket.id;
 
-    socket.to(socket.roomId).emit('play-pause', data);
+    // Broadcast to everyone except sender
+    socket.to(socket.roomId).emit('play-pause', {
+      ...data,
+      controlledBy: socket.username,
+      controllerId: socket.id
+    });
   });
 
-  // --- Seek ---
+  // --- Seek (anyone can seek) ---
   socket.on('seek', (data) => {
     if (!socket.roomId) return;
 
@@ -117,8 +134,13 @@ io.on('connection', (socket) => {
     room.currentTime = data.currentTime;
     room.isPlaying = data.isPlaying || false;
     room.lastUpdate = Date.now();
+    room.lastController = socket.id;
 
-    socket.to(socket.roomId).emit('seek', data);
+    socket.to(socket.roomId).emit('seek', {
+      ...data,
+      controlledBy: socket.username,
+      controllerId: socket.id
+    });
   });
 
   // --- Manual Sync Request ---
@@ -134,26 +156,50 @@ io.on('connection', (socket) => {
       currentTime: Math.max(0, estimatedCurrentTime),
       isPlaying: room.isPlaying,
       type: room.currentVideo?.type || "youtube",
-      serverTime: Date.now()
+      serverTime: Date.now(),
+      lastController: room.lastController
     });
   });
 
-  // --- Heartbeat (Host only) ---
+  // --- Heartbeat (from current controller) ---
   socket.on('heartbeat', (data) => {
     if (!socket.roomId) return;
     const room = getRoom(socket.roomId);
 
-    // Only host updates heartbeat
-    if (room.hostId !== socket.id) return;
+    // Accept heartbeat from anyone, but prioritize recent controllers
+    const timeSinceLastControl = Date.now() - room.lastUpdate;
+    
+    // If this is from the last controller or no recent activity, accept it
+    if (room.lastController === socket.id || timeSinceLastControl > 10000) {
+      room.isPlaying = data.isPlaying;
+      room.currentTime = data.currentTime || 0;
+      room.lastUpdate = Date.now();
+
+      // Send to all others
+      socket.to(socket.roomId).emit('heartbeat', {
+        ...data,
+        from: socket.username,
+        fromId: socket.id
+      });
+    }
+  });
+
+  // --- State Update (for real-time sync) ---
+  socket.on('state-update', (data) => {
+    if (!socket.roomId) return;
+    const room = getRoom(socket.roomId);
 
     room.isPlaying = data.isPlaying;
     room.currentTime = data.currentTime || 0;
     room.lastUpdate = Date.now();
+    room.lastController = socket.id;
 
-    // Send to all others
-    socket.to(socket.roomId).emit('heartbeat', data);
-
-    // console.log(`❤️ Heartbeat from host ${socket.username} in ${socket.roomId}`);
+    // Broadcast to others immediately
+    socket.to(socket.roomId).emit('state-update', {
+      ...data,
+      from: socket.username,
+      fromId: socket.id
+    });
   });
 
   // --- Chat ---
@@ -163,7 +209,8 @@ io.on('connection', (socket) => {
     const chatData = {
       username: socket.username,
       message: message.trim(),
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      userId: socket.id
     };
 
     io.to(socket.roomId).emit('chat-message', chatData);
@@ -184,18 +231,18 @@ io.on('connection', (socket) => {
         if (nextHost) {
           const newHost = room.users.get(nextHost);
           console.log(`👑 New host in room ${socket.roomId}: ${newHost.username}`);
-          io.to(socket.roomId).emit('room-state', {
-            ...room,
-            roomId: socket.roomId,
-            hostId: room.hostId
+          io.to(socket.roomId).emit('host-change', {
+            newHostId: nextHost,
+            newHostName: newHost.username
           });
-        } else {
-          console.log(`Room ${socket.roomId} now has no host`);
         }
       }
 
       if (socket.username) {
-        socket.to(socket.roomId).emit('user-left', socket.username);
+        socket.to(socket.roomId).emit('user-left', {
+          username: socket.username,
+          userId: socket.id
+        });
       }
 
       const userList = Array.from(room.users.values());
