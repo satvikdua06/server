@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const fetch = require('node-fetch');
+
 
 const app = express();
 const server = http.createServer(app);
@@ -257,6 +259,22 @@ io.on('connection', (socket) => {
   });
 });
 
+app.get('/api/search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.status(400).json({ error: 'Search query is required' });
+    }
+
+    try {
+        const apiUrl = `https://jiosaavn-api-private.vercel.app/search/songs?query=${encodeURIComponent(query)}`;
+        const response = await fetch(apiUrl);
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        console.error('Search API error:', error);
+        res.status(500).json({ error: 'Failed to fetch search results' });
+    }
+});
 // Health check
 app.get('/', (req, res) => {
   res.json({
