@@ -43,5 +43,5 @@ Thumbs.db
 dist/
 build/
 
-# Railway
-.railway/
+# Render
+.render/
